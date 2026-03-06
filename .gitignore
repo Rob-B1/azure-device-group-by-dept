@@ -1,0 +1,23 @@
+# Secrets / local config overrides
+*.secret
+*.key
+*.pfx
+*.cer
+local.config.json
+
+# PowerShell
+*.pssproj.user
+
+# Output files
+*.csv
+*.log
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Editor
+.vscode/
+*.suo
+*.user
