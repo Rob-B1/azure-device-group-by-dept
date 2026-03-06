@@ -93,17 +93,14 @@ foreach ($dept in $deptGroups.Keys) {
         $expectedDeviceIds = $deptDeviceMap[$dept] | Where-Object { $_ } | ForEach-Object { $_.ToLower() }
     }
 
-    # FIX: AdditionalProperties['@odata.type'] is required — $member.'@odata.type'
-    # returns nothing from the Graph SDK, leaving $actualMemberIds empty and causing
-    # every expected device to attempt an add (resulting in duplicate-member errors).
+    # Use Get-MgGroupMemberAsDevice which returns only device-type members directly,
+    # avoiding unreliable @odata.type filtering on generic DirectoryObject results.
     $actualMemberIds = @()
     try {
-        $members = Get-MgGroupMember -GroupId $groupId -All
-        foreach ($member in $members) {
-            if ($member.AdditionalProperties['@odata.type'] -eq '#microsoft.graph.device') {
-                $actualMemberIds += $member.Id.ToLower()
-            }
-        }
+        $actualMemberIds = @(
+            Get-MgGroupMemberAsDevice -GroupId $groupId -All |
+            ForEach-Object { $_.Id.ToLower() }
+        )
     } catch {
         Write-Warning "Failed to retrieve members for group '$dept Devices': $_"
         continue

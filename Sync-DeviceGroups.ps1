@@ -89,11 +89,10 @@ function Sync-GroupMembers {
         [bool]     $DryRun
     )
 
-    # Current members (devices only – OData type lives in AdditionalProperties in the Graph SDK)
-    $currentMembers = Get-MgGroupMember -GroupId $GroupId -All -ErrorAction SilentlyContinue
+    # Use Get-MgGroupMemberAsDevice which returns only device-type members directly,
+    # avoiding unreliable @odata.type filtering on generic DirectoryObject results.
     $currentDeviceIds = @(
-        $currentMembers |
-        Where-Object { $_.AdditionalProperties['@odata.type'] -eq '#microsoft.graph.device' } |
+        Get-MgGroupMemberAsDevice -GroupId $GroupId -All -ErrorAction SilentlyContinue |
         Select-Object -ExpandProperty Id
     )
 
