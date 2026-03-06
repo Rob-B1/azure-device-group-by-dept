@@ -9,7 +9,7 @@ Two approaches are provided depending on your device management platform:
 | Approach | Script | Device source |
 |---|---|---|
 | **Entra ID** | `Sync-DeviceGroups.ps1` / `Get-DeviceReport.ps1` | `Get-MgDevice` + registered owner |
-| **Intune (MDM)** | `test.ps1` | `Get-MgDeviceManagementManagedDevice` + assigned user |
+| **Intune (MDM)** | `Sync-IntuneDeviceGroups.ps1` | `Get-MgDeviceManagementManagedDevice` + assigned user |
 
 ---
 
@@ -20,7 +20,7 @@ Two approaches are provided depending on your device management platform:
 | `config.json` | Tenant / client ID, group naming, exclusions |
 | `Get-DeviceReport.ps1` | Read & report Entra ID devices grouped by department |
 | `Sync-DeviceGroups.ps1` | Create / update one group per department (Entra ID approach) |
-| `test.ps1` | Create / update one group per department (Intune approach) |
+| `Sync-IntuneDeviceGroups.ps1` | Create / update one group per department (Intune approach) |
 
 ---
 
@@ -38,7 +38,7 @@ Two approaches are provided depending on your device management platform:
 |---|---|
 | `Get-DeviceReport.ps1` | `Device.Read.All`, `User.Read.All`, `Group.Read.All` |
 | `Sync-DeviceGroups.ps1` | `Device.Read.All`, `User.Read.All`, `Group.ReadWrite.All`, `GroupMember.ReadWrite.All` |
-| `test.ps1` | `DeviceManagementManagedDevices.Read.All`, `User.Read.All`, `Group.ReadWrite.All`, `GroupMember.ReadWrite.All` |
+| `Sync-IntuneDeviceGroups.ps1` | `DeviceManagementManagedDevices.Read.All`, `User.Read.All`, `Group.ReadWrite.All`, `GroupMember.ReadWrite.All` |
 
 Grant as **delegated permissions** on your app registration for interactive sign-in.
 
@@ -117,7 +117,7 @@ A device can appear in multiple groups if it has owners across different departm
 
 ---
 
-## Approach 2 — Intune (`test.ps1`)
+## Approach 2 — Intune (`Sync-IntuneDeviceGroups.ps1`)
 
 Uses `Get-MgDeviceManagementManagedDevice` and each device's **assigned user** (`userId`)
 to determine department. Targets Windows and macOS Intune-managed devices only.
@@ -126,7 +126,7 @@ Groups are named `<Department> Devices` (e.g. `Engineering Devices`).
 ### Run
 
 ```powershell
-.\test.ps1
+.\Sync-IntuneDeviceGroups.ps1
 ```
 
 A browser credential prompt will appear on launch. No config file is required —
