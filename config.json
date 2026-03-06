@@ -1,0 +1,8 @@
+{
+  "TenantId": "<YOUR_TENANT_ID>",
+  "ClientId": "<YOUR_CLIENT_ID>",
+  "GroupNamePrefix": "DEPT-DEVICES-",
+  "GroupDescription": "Auto-managed group for {Department} department devices",
+  "ExcludeDepartments": [],
+  "DryRun": false
+}
