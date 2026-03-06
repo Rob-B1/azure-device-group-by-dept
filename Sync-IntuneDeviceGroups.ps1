@@ -49,14 +49,19 @@ foreach ($device in $devices) {
 #    reassigned devices were never removed from their old department's group.
 $deptGroups = @{}
 
+# Groups are named "DEPT-<Department> Devices" so the startsWith filter only
+# ever matches groups created by this script, never unrelated groups.
+$groupPrefix = 'DEPT-'
+$groupSuffix = ' Devices'
+
 Write-Host "Discovering existing department device groups..." -ForegroundColor Cyan
 $existingGroups = Get-MgGroup `
-    -Filter "endsWith(displayName,' Devices') and securityEnabled eq true" `
+    -Filter "startsWith(displayName,'$groupPrefix') and securityEnabled eq true" `
     -ConsistencyLevel eventual `
     -CountVariable existingCount `
     -All
 foreach ($grp in $existingGroups) {
-    $existingDept = $grp.DisplayName -replace '\s+Devices$', ''
+    $existingDept = $grp.DisplayName.Substring($groupPrefix.Length) -replace "$groupSuffix$", ''
     if (-not $deptGroups.ContainsKey($existingDept)) {
         $deptGroups[$existingDept] = $grp
     }
@@ -66,13 +71,13 @@ foreach ($grp in $existingGroups) {
 foreach ($dept in $deptDeviceMap.Keys) {
     if ($deptGroups.ContainsKey($dept)) { continue }
     try {
-        $displayName = "$dept Devices"
+        $displayName = "$groupPrefix$dept$groupSuffix"
         $params = @{
             DisplayName     = $displayName
             Description     = "Device group for $dept department"
             MailEnabled     = $false
             SecurityEnabled = $true
-            MailNickname    = (($dept -replace '[^a-zA-Z0-9]', '') + "Devices")
+            MailNickname    = ('DEPT' + ($dept -replace '[^a-zA-Z0-9]', '') + 'Devices')
         }
         $newGroup = New-MgGroup @params
         $deptGroups[$dept] = $newGroup
@@ -102,7 +107,7 @@ foreach ($dept in $deptGroups.Keys) {
             ForEach-Object { $_.Id.ToLower() }
         )
     } catch {
-        Write-Warning "Failed to retrieve members for group '$dept Devices': $_"
+        Write-Warning "Failed to retrieve members for group "$groupPrefix$dept$groupSuffix": $_"
         continue
     }
 
@@ -112,13 +117,13 @@ foreach ($dept in $deptGroups.Keys) {
     foreach ($deviceId in $toAdd) {
         try {
             New-MgGroupMember -GroupId $groupId -DirectoryObjectId $deviceId
-            Write-Host "Added $deviceId to '$dept Devices'"
+            Write-Host "Added $deviceId to "$groupPrefix$dept$groupSuffix""
         } catch {
             $errorText = $_ | Out-String
             if ($errorText -match 'already exist' -or $errorText -match 'added object references already exist') {
-                Write-Verbose "Device $deviceId already in '$dept Devices' (skipped)."
+                Write-Verbose "Device $deviceId already in "$groupPrefix$dept$groupSuffix" (skipped)."
             } else {
-                Write-Warning "Failed to add $deviceId to '$dept Devices': $errorText"
+                Write-Warning "Failed to add $deviceId to "$groupPrefix$dept$groupSuffix": $errorText"
             }
         }
     }
@@ -126,14 +131,14 @@ foreach ($dept in $deptGroups.Keys) {
     foreach ($deviceId in $toRemove) {
         try {
             Remove-MgGroupMemberByRef -GroupId $groupId -DirectoryObjectId $deviceId
-            Write-Host "Removed $deviceId from '$dept Devices'"
+            Write-Host "Removed $deviceId from "$groupPrefix$dept$groupSuffix""
         } catch {
-            Write-Warning "Failed to remove $deviceId from '$dept Devices': $_"
+            Write-Warning "Failed to remove $deviceId from "$groupPrefix$dept$groupSuffix": $_"
         }
     }
 
     if (-not $toAdd -and -not $toRemove) {
-        Write-Host "No changes for '$dept Devices'" -ForegroundColor DarkGray
+        Write-Host "No changes for "$groupPrefix$dept$groupSuffix"" -ForegroundColor DarkGray
     }
 }
 

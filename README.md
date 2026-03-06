@@ -121,7 +121,9 @@ A device can appear in multiple groups if it has owners across different departm
 
 Uses `Get-MgDeviceManagementManagedDevice` and each device's **assigned user** (`userId`)
 to determine department. Targets Windows and macOS Intune-managed devices only.
-Groups are named `<Department> Devices` (e.g. `Engineering Devices`).
+Groups are named `DEPT-<Department> Devices` (e.g. `DEPT-Engineering Devices`).
+The `DEPT-` prefix ensures the script only ever touches groups it created and never
+modifies unrelated groups that happen to end in " Devices".
 
 ### Run
 
