@@ -22,10 +22,19 @@
     Compute and display all pending adds, removes, and group creations without
     applying any changes. Useful for reviewing what the sync will do before running it.
 
+.PARAMETER Audit
+    Report the current state: for every Intune-managed device show its assigned user,
+    department, and which DEPT-* group(s) it currently belongs to. No changes are made.
+
+.PARAMETER OutputCsv
+    When used with -Audit, writes the audit rows to this CSV file path.
+
 .PARAMETER WhatIf
     Preview actions inline without applying any changes to Entra ID.
 
 .EXAMPLE
+    .\Sync-IntuneDeviceGroups.ps1 -Audit
+    .\Sync-IntuneDeviceGroups.ps1 -Audit -OutputCsv .\audit.csv
     .\Sync-IntuneDeviceGroups.ps1 -Report
     .\Sync-IntuneDeviceGroups.ps1 -WhatIf
     .\Sync-IntuneDeviceGroups.ps1
@@ -34,7 +43,9 @@
 [CmdletBinding(SupportsShouldProcess)]
 param (
     [string] $TenantId = "",
-    [switch] $Report
+    [switch] $Report,
+    [switch] $Audit,
+    [string] $OutputCsv = ""
 )
 
 Set-StrictMode -Version Latest
@@ -286,6 +297,70 @@ function Write-ChangeReport {
     }
 }
 
+function Get-DeviceGroupMap {
+    param ([hashtable] $DeptGroups)
+
+    $map = @{}   # aadObjectId -> List<groupDisplayName>
+    foreach ($dept in $DeptGroups.Keys) {
+        $grp = $DeptGroups[$dept]
+        try {
+            $memberIds = @(
+                Get-MgGroupMemberAsDevice -GroupId $grp.Id -All |
+                Select-Object -ExpandProperty Id
+            )
+        }
+        catch {
+            Write-Warning "  Could not read members of '$($grp.DisplayName)': $_"
+            continue
+        }
+        foreach ($memberId in $memberIds) {
+            if (-not $map.ContainsKey($memberId)) {
+                $map[$memberId] = [System.Collections.Generic.List[string]]::new()
+            }
+            $map[$memberId].Add($grp.DisplayName)
+        }
+    }
+    return $map
+}
+
+function Write-AuditReport {
+    param (
+        [object[]] $Rows,
+        [string]   $OutputCsv
+    )
+
+    Write-Host "`n== Intune Device Audit Report ==" -ForegroundColor Cyan
+    Write-Host "  Showing current device, user, and DEPT group membership.`n" -ForegroundColor DarkGray
+
+    $grouped = $Rows | Group-Object Department | Sort-Object Name
+    foreach ($grp in $grouped) {
+        Write-Host "  Department: $($grp.Name) ($($grp.Count) device(s))" -ForegroundColor White
+        foreach ($row in ($grp.Group | Sort-Object DeviceName)) {
+            $color = if ($row.DeptGroups -eq '(Not in any DEPT group)') { 'DarkGray' } else { 'Green' }
+            Write-Host ("    {0,-32} {1,-35} {2}" -f $row.DeviceName, $row.UserUPN, $row.DeptGroups) -ForegroundColor $color
+        }
+        Write-Host ""
+    }
+
+    $inGroup    = @($Rows | Where-Object { $_.DeptGroups -ne '(Not in any DEPT group)' }).Count
+    $notInGroup = @($Rows | Where-Object { $_.DeptGroups -eq '(Not in any DEPT group)' }).Count
+    $noUser     = @($Rows | Where-Object { $_.UserUPN -eq '(No user)' }).Count
+    $noAAD      = @($Rows | Where-Object { $_.AADObjectId -eq '(Not in AAD)' }).Count
+
+    Write-Host "── Summary ──────────────────────────────────────────────────────" -ForegroundColor Cyan
+    Write-Host "  Total devices       : $($Rows.Count)"
+    Write-Host "  In a DEPT group     : $inGroup"
+    Write-Host "  Not in any group    : $notInGroup"
+    if ($noUser  -gt 0) { Write-Host "  No assigned user    : $noUser"  -ForegroundColor Yellow }
+    if ($noAAD   -gt 0) { Write-Host "  Not found in AAD    : $noAAD"   -ForegroundColor Yellow }
+
+    if ($OutputCsv) {
+        $Rows | Sort-Object Department, DeviceName |
+            Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+        Write-Host "`n  Report saved to: $OutputCsv" -ForegroundColor Green
+    }
+}
+
 #endregion
 
 #region ── Main ───────────────────────────────────────────────────────────────
@@ -386,6 +461,45 @@ if ($Report) {
         Get-GroupChanges -GroupId $groupId -GroupName $groupName -DesiredDeviceIds $deviceIds
     }
     Write-ChangeReport -Changes $changes
+    Disconnect-MgGraph | Out-Null
+    return
+}
+
+# ── Audit mode: report current device → user → DEPT group membership ─────────
+if ($Audit) {
+    Write-Host "`nBuilding device group membership map..."
+    $deviceGroupMap = Get-DeviceGroupMap -DeptGroups $deptGroups
+
+    $auditRows = [System.Collections.Generic.List[PSCustomObject]]::new()
+    foreach ($device in $intuneDevices) {
+        $aadObjectId = $null
+        if ($device.azureADDeviceId -and $aadDeviceMap.ContainsKey($device.azureADDeviceId)) {
+            $aadObjectId = $aadDeviceMap[$device.azureADDeviceId]
+        }
+
+        $dept = $null
+        if ($device.userId) {
+            $dept = Get-DepartmentForUser -UserId $device.userId -Cache $userCache
+        }
+
+        $groupStr = if ($aadObjectId -and $deviceGroupMap.ContainsKey($aadObjectId)) {
+            $deviceGroupMap[$aadObjectId] -join '; '
+        } else {
+            '(Not in any DEPT group)'
+        }
+
+        $auditRows.Add([PSCustomObject]@{
+            DeviceName  = $device.deviceName
+            OS          = $device.operatingSystem
+            UserUPN     = if ($device.userPrincipalName) { $device.userPrincipalName } else { '(No user)' }
+            Department  = if ($dept) { $dept } else { '(No department)' }
+            DeptGroups  = $groupStr
+            AADObjectId = if ($aadObjectId) { $aadObjectId } else { '(Not in AAD)' }
+            IntuneId    = $device.id
+        })
+    }
+
+    Write-AuditReport -Rows $auditRows -OutputCsv $OutputCsv
     Disconnect-MgGraph | Out-Null
     return
 }
