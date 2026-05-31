@@ -18,17 +18,23 @@
 .PARAMETER TenantId
     Entra ID tenant ID. Optional — narrows the interactive login to a specific tenant.
 
+.PARAMETER Report
+    Compute and display all pending adds, removes, and group creations without
+    applying any changes. Useful for reviewing what the sync will do before running it.
+
 .PARAMETER WhatIf
-    Preview actions without applying any changes to Entra ID.
+    Preview actions inline without applying any changes to Entra ID.
 
 .EXAMPLE
+    .\Sync-IntuneDeviceGroups.ps1 -Report
     .\Sync-IntuneDeviceGroups.ps1 -WhatIf
     .\Sync-IntuneDeviceGroups.ps1
     .\Sync-IntuneDeviceGroups.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param (
-    [string] $TenantId = ""
+    [string] $TenantId = "",
+    [switch] $Report
 )
 
 Set-StrictMode -Version Latest
@@ -186,6 +192,100 @@ function Sync-GroupMembers {
     return [PSCustomObject]@{ Added = $toAdd.Count; Removed = $toRemove.Count }
 }
 
+function Get-GroupChanges {
+    param (
+        [string]   $GroupId,           # $null when the group doesn't exist yet
+        [string]   $GroupName,
+        [string[]] $DesiredDeviceIds
+    )
+
+    if (-not $GroupId) {
+        return [PSCustomObject]@{
+            GroupName = $GroupName
+            IsNew     = $true
+            ToAdd     = $DesiredDeviceIds
+            ToRemove  = @()
+            Error     = $null
+        }
+    }
+
+    try {
+        $current = @(
+            Get-MgGroupMemberAsDevice -GroupId $GroupId -All |
+            Select-Object -ExpandProperty Id
+        )
+    }
+    catch {
+        return [PSCustomObject]@{
+            GroupName = $GroupName
+            IsNew     = $false
+            ToAdd     = @()
+            ToRemove  = @()
+            Error     = "Could not read membership: $_"
+        }
+    }
+
+    return [PSCustomObject]@{
+        GroupName = $GroupName
+        IsNew     = $false
+        ToAdd     = @($DesiredDeviceIds | Where-Object { $_ -notin $current })
+        ToRemove  = @($current | Where-Object { $_ -notin $DesiredDeviceIds })
+        Error     = $null
+    }
+}
+
+function Write-ChangeReport {
+    param ([object[]] $Changes)
+
+    Write-Host "`n== Pending Changes Report ==" -ForegroundColor Cyan
+    Write-Host "  No changes will be applied. Run without -Report to sync.`n" -ForegroundColor DarkGray
+
+    $totalNew      = 0
+    $totalToAdd    = 0
+    $totalToRemove = 0
+    $unchanged     = 0
+    $errorCount    = 0
+
+    foreach ($change in ($Changes | Sort-Object GroupName)) {
+        $hasChanges = $change.IsNew -or $change.ToAdd.Count -gt 0 -or $change.ToRemove.Count -gt 0
+        $newLabel   = if ($change.IsNew) { '  [NEW GROUP]' } else { '' }
+
+        Write-Host "  $($change.GroupName)$newLabel" -ForegroundColor White
+
+        if ($change.Error) {
+            Write-Host "    [ERROR] $($change.Error)" -ForegroundColor Red
+            $errorCount++
+        }
+        elseif (-not $hasChanges) {
+            Write-Host "    No changes" -ForegroundColor DarkGray
+            $unchanged++
+        }
+        else {
+            if ($change.IsNew) { $totalNew++ }
+            if ($change.ToAdd.Count -gt 0) {
+                Write-Host "    Add ($($change.ToAdd.Count)):" -ForegroundColor Green
+                $change.ToAdd | ForEach-Object { Write-Host "      + $_" -ForegroundColor Green }
+                $totalToAdd += $change.ToAdd.Count
+            }
+            if ($change.ToRemove.Count -gt 0) {
+                Write-Host "    Remove ($($change.ToRemove.Count)):" -ForegroundColor Red
+                $change.ToRemove | ForEach-Object { Write-Host "      - $_" -ForegroundColor Red }
+                $totalToRemove += $change.ToRemove.Count
+            }
+        }
+        Write-Host ""
+    }
+
+    Write-Host "── Summary ──────────────────────────────────────────────────────" -ForegroundColor Cyan
+    Write-Host "  Groups to create  : $totalNew"
+    Write-Host "  Devices to add    : $totalToAdd"
+    Write-Host "  Devices to remove : $totalToRemove"
+    Write-Host "  Groups unchanged  : $unchanged"
+    if ($errorCount -gt 0) {
+        Write-Host "  Read errors       : $errorCount" -ForegroundColor Red
+    }
+}
+
 #endregion
 
 #region ── Main ───────────────────────────────────────────────────────────────
@@ -273,6 +373,21 @@ foreach ($grp in $existingGroups) {
     if (-not $deptGroups.ContainsKey($existingDept)) {
         $deptGroups[$existingDept] = $grp
     }
+}
+
+# ── Report mode: show all pending changes and exit without writing anything ───
+if ($Report) {
+    $allDepts = @(@($deptGroups.Keys) + @($deptDeviceMap.Keys) | Sort-Object -Unique)
+    $changes  = foreach ($dept in $allDepts) {
+        $deviceIds = [string[]]@()
+        if ($deptDeviceMap.ContainsKey($dept)) { $deviceIds = [string[]]$deptDeviceMap[$dept] }
+        $groupName = "$GroupPrefix$dept$GroupSuffix"
+        $groupId   = if ($deptGroups.ContainsKey($dept)) { $deptGroups[$dept].Id } else { $null }
+        Get-GroupChanges -GroupId $groupId -GroupName $groupName -DesiredDeviceIds $deviceIds
+    }
+    Write-ChangeReport -Changes $changes
+    Disconnect-MgGraph | Out-Null
+    return
 }
 
 # Create groups for newly discovered departments that don't have one yet
