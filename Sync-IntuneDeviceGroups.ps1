@@ -9,7 +9,8 @@
     3. Resolves each Intune device to its Azure AD object ID.
     4. For each discovered department, ensures a security group named
        "DEPT-<Department> Devices" exists (creates it if missing).
-    5. Syncs group membership: adds devices that belong and removes those that don't.
+    5. Removes any device from DEPT groups it no longer belongs to (department changes).
+    6. Syncs group membership: adds devices that belong and removes those that don't.
 
     Run with -WhatIf to preview all changes without making them.
     Groups managed by this script always begin with "DEPT-" and end with " Devices"
@@ -297,6 +298,58 @@ function Write-ChangeReport {
     }
 }
 
+function Remove-StaleGroupMembers {
+    param (
+        [object]    $DeptDeviceMap,  # Dictionary<dept, List<aadObjectId>>
+        [hashtable] $DeptGroups,     # dept -> group object
+        [bool]      $DryRun
+    )
+
+    # Build: aadObjectId -> correct group ID so we can detect misplaced devices.
+    $deviceCorrectGroup = @{}
+    foreach ($dept in $DeptDeviceMap.Keys) {
+        if (-not $DeptGroups.ContainsKey($dept)) { continue }
+        foreach ($aadObjectId in $DeptDeviceMap[$dept]) {
+            $deviceCorrectGroup[$aadObjectId] = $DeptGroups[$dept].Id
+        }
+    }
+
+    $removed = 0
+    foreach ($dept in ($DeptGroups.Keys | Sort-Object)) {
+        $grp = $DeptGroups[$dept]
+        try {
+            $memberIds = @(
+                Get-MgGroupMemberAsDevice -GroupId $grp.Id -All |
+                Select-Object -ExpandProperty Id
+            )
+        }
+        catch {
+            Write-Warning "    Could not read members of '$($grp.DisplayName)' — skipping cleanup: $_"
+            continue
+        }
+
+        foreach ($memberId in $memberIds) {
+            $correctGroupId = if ($deviceCorrectGroup.ContainsKey($memberId)) { $deviceCorrectGroup[$memberId] } else { $null }
+            if ($correctGroupId -eq $grp.Id) { continue }
+
+            if ($DryRun) {
+                Write-Host "    [WHATIF] Would remove stale device $memberId from $($grp.DisplayName)" -ForegroundColor Yellow
+            }
+            else {
+                Write-Host "    - Stale: removing device $memberId from $($grp.DisplayName)" -ForegroundColor Red
+                try {
+                    Remove-MgGroupMemberByRef -GroupId $grp.Id -DirectoryObjectId $memberId
+                    $removed++
+                }
+                catch {
+                    Write-Warning "    Failed to remove stale ${memberId} from $($grp.DisplayName): $_"
+                }
+            }
+        }
+    }
+    return $removed
+}
+
 function Get-DeviceGroupMap {
     param ([hashtable] $DeptGroups)
 
@@ -433,6 +486,7 @@ Write-Host "`nStep 4/4  Syncing groups..."
 
 $totalAdded    = 0
 $totalRemoved  = 0
+$staleRemoved  = 0
 $groupsCreated = 0
 
 # Seed deptGroups from ALL existing DEPT-* Devices groups so stale departments
@@ -504,6 +558,13 @@ if ($Audit) {
     return
 }
 
+# ── Cleanup: remove any device found in a group whose department it no longer belongs to ──
+Write-Host "`n  Removing stale group memberships (department changes)..."
+$staleRemoved = Remove-StaleGroupMembers -DeptDeviceMap $deptDeviceMap -DeptGroups $deptGroups -DryRun $isDryRun
+if (-not $isDryRun -and $staleRemoved -eq 0) {
+    Write-Host "    (No stale memberships found)" -ForegroundColor DarkGray
+}
+
 # Create groups for newly discovered departments that don't have one yet
 foreach ($dept in $deptDeviceMap.Keys) {
     if ($deptGroups.ContainsKey($dept)) { continue }
@@ -532,6 +593,7 @@ foreach ($dept in ($deptGroups.Keys | Sort-Object)) {
 Write-Host "`n== Summary ==" -ForegroundColor Cyan
 Write-Host "  Departments processed : $($deptGroups.Count)"
 Write-Host "  Groups created        : $groupsCreated"
+Write-Host "  Stale memberships     : $staleRemoved"
 Write-Host "  Members added         : $totalAdded"
 Write-Host "  Members removed       : $totalRemoved"
 
