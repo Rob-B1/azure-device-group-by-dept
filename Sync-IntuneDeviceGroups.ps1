@@ -127,10 +127,18 @@ function Sync-GroupMembers {
         [bool]     $DryRun
     )
 
-    $currentDeviceIds = @(
-        Get-MgGroupMemberAsDevice -GroupId $GroupId -All -ErrorAction SilentlyContinue |
-        Select-Object -ExpandProperty Id
-    )
+    # Read current membership inside a try-catch so that a failed API call
+    # does not produce an empty list and cause every device to be re-added.
+    try {
+        $currentDeviceIds = @(
+            Get-MgGroupMemberAsDevice -GroupId $GroupId -All |
+            Select-Object -ExpandProperty Id
+        )
+    }
+    catch {
+        Write-Warning "      Could not read membership for group $GroupId — skipping sync: $_"
+        return [PSCustomObject]@{ Added = 0; Removed = 0 }
+    }
 
     $toAdd    = $DesiredDeviceIds | Where-Object { $_ -notin $currentDeviceIds }
     $toRemove = $currentDeviceIds | Where-Object { $_ -notin $DesiredDeviceIds }
@@ -141,8 +149,18 @@ function Sync-GroupMembers {
         }
         else {
             Write-Host "      + Adding device $deviceId" -ForegroundColor Green
-            $odataBody = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$deviceId" }
-            New-MgGroupMemberByRef -GroupId $GroupId -BodyParameter $odataBody -ErrorAction SilentlyContinue
+            try {
+                $odataBody = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$deviceId" }
+                New-MgGroupMemberByRef -GroupId $GroupId -BodyParameter $odataBody
+            }
+            catch {
+                if (($_ | Out-String) -match 'already exist') {
+                    Write-Verbose "      Device $deviceId already in group (skipped)."
+                }
+                else {
+                    Write-Warning "      Failed to add ${deviceId}: $_"
+                }
+            }
         }
     }
 
@@ -152,7 +170,12 @@ function Sync-GroupMembers {
         }
         else {
             Write-Host "      - Removing device $deviceId" -ForegroundColor Red
-            Remove-MgGroupMemberByRef -GroupId $GroupId -DirectoryObjectId $deviceId -ErrorAction SilentlyContinue
+            try {
+                Remove-MgGroupMemberByRef -GroupId $GroupId -DirectoryObjectId $deviceId
+            }
+            catch {
+                Write-Warning "      Failed to remove ${deviceId}: $_"
+            }
         }
     }
 
