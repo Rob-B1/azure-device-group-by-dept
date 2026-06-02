@@ -125,10 +125,57 @@ Groups are named `DEPT-<Department> Devices` (e.g. `DEPT-Engineering Devices`).
 The `DEPT-` prefix ensures the script only ever touches groups it created and never
 modifies unrelated groups that happen to end in " Devices".
 
+### Operating modes
+
+#### Report mode — preview pending changes without connecting to Entra ID
+
+```powershell
+# Show what would change (requires Intune, reads current state)
+.\Sync-IntuneDeviceGroups.ps1 -Report
+```
+
+Prints a table of all devices with their current department, target group, and whether they need to be added or removed. No API writes are made.
+
+#### Audit mode — show current group membership and flag mismatches
+
+```powershell
+# Display full membership audit in the console
+.\Sync-IntuneDeviceGroups.ps1 -Audit
+
+# Save audit to CSV
+.\Sync-IntuneDeviceGroups.ps1 -Audit -OutputCsv .\audit.csv
+```
+
+Lists every device grouped by department, showing which group they belong to and flagging any device that is in the wrong group (i.e. whose department has changed). Useful before running a full sync.
+
+#### Sync mode — apply changes
+
+```powershell
+# Apply — creates/updates groups, adds/removes members, cleans up stale memberships
+.\Sync-IntuneDeviceGroups.ps1
+
+# Dry run — show changes without writing anything
+.\Sync-IntuneDeviceGroups.ps1 -DryRun
+```
+
+#### Stale membership cleanup
+
+When a user moves to a different department their device needs to leave the old group and join the new one. The sync includes a cleanup step that:
+
+1. Builds a map of device → correct group based on current department data
+2. Scans all `DEPT-*` groups for devices that belong in a different group
+3. Removes stale memberships before adding correct ones
+
+This runs automatically as part of every sync. Use `-DryRun` to preview removals first.
+
 ### Run
 
 ```powershell
+# Interactive sign-in (browser prompt)
 .\Sync-IntuneDeviceGroups.ps1
+
+# Dry run first to see what would change
+.\Sync-IntuneDeviceGroups.ps1 -DryRun
 ```
 
 A browser credential prompt will appear on launch. No config file is required —
@@ -149,8 +196,11 @@ AzureADDeviceId  ──► AAD Object ID lookup (Get-MgDevice)
       ▼
 Map: Department → [AAD Device Object IDs]
       │
-      └─► Sync groups
-              ├─ Discover all existing "* Devices" groups
+      ├─► -Report  → preview table (no writes)
+      ├─► -Audit   → membership audit table / CSV
+      └─► Sync
+              ├─ Remove stale memberships (department changes)
+              ├─ Discover all existing DEPT-* groups
               ├─ Create missing groups
               ├─ Add devices that should be members
               └─ Remove devices that no longer belong
@@ -162,10 +212,24 @@ Devices with no assigned user, no department, or no matching AAD object ID are s
 
 ## Automation
 
-Schedule `Sync-DeviceGroups.ps1` as an **Azure Automation runbook** or a
-**Windows Task Scheduler** job to keep groups up to date automatically.
+Schedule `Sync-DeviceGroups.ps1` or `Sync-IntuneDeviceGroups.ps1` as an **Azure Automation runbook** or a **Windows Task Scheduler** job to keep groups up to date automatically.
 
-Example Task Scheduler command:
+### Windows Task Scheduler
+
 ```
-pwsh.exe -NonInteractive -File "C:\Scripts\azure-device-group-by-dept\Sync-DeviceGroups.ps1"
+pwsh.exe -NonInteractive -File "C:\Scripts\azure-device-group-by-dept\Sync-IntuneDeviceGroups.ps1"
 ```
+
+### Azure Automation runbook
+
+1. Create an **Automation Account** in Azure Portal
+2. Under **Modules**, import `Microsoft.Graph.Authentication`, `Microsoft.Graph.DeviceManagement`, `Microsoft.Graph.Groups`, `Microsoft.Graph.Users`
+3. Create a **Managed Identity** for the Automation Account and grant it the required Graph API permissions
+4. Create a **PowerShell 7.2 runbook** and paste the script content
+5. Update the `TenantId` at the top of the script to use the managed identity sign-in method:
+   ```powershell
+   Connect-MgGraph -Identity
+   ```
+6. Schedule the runbook (daily recommended)
+
+The managed identity removes the interactive browser prompt — the script will authenticate silently using the Automation Account's identity.
