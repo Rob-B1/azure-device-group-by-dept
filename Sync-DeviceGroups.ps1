@@ -9,8 +9,22 @@
     3. For each discovered department, ensures a security group named
        "<GroupNamePrefix><Department>" exists (creates it if missing).
     4. Syncs group membership: adds devices that belong and removes those that don't.
+    5. Writes a JSON run summary to AuditOutputDir (default: ./audit-logs).
+    6. Uploads the summary to S3 if S3Bucket is configured in config.json.
 
     Run with -WhatIf to preview all changes without making them.
+
+    Config fields (config.json):
+      TenantId            — Entra ID tenant ID
+      GroupNamePrefix     — prefix for all managed groups (e.g. "DEPT-DEVICES-")
+      GroupDescription    — group description template; {Department} is substituted
+      ExcludeDepartments  — departments to always skip (blocklist)
+      AllowedDepartments  — if non-empty, only these departments are processed;
+                            anything else triggers a warning and is skipped (allowlist)
+      DryRun              — if true, preview changes without applying
+      AuditOutputDir      — local directory for JSON run summaries (default: ./audit-logs)
+      S3Bucket            — S3 bucket name for long-term audit retention (optional)
+      S3Prefix            — S3 key prefix for uploads (default: "azure-device-sync/")
 
 .PARAMETER ConfigPath
     Path to config.json. Defaults to config.json in the same directory as this script.
@@ -127,11 +141,43 @@ function Sync-GroupMembers {
     return [PSCustomObject]@{ Added = $toAdd.Count; Removed = $toRemove.Count }
 }
 
+function Export-RunSummary {
+    param (
+        [hashtable] $Summary,
+        [string]    $OutputDir,
+        [string]    $S3Bucket,
+        [string]    $S3Prefix
+    )
+
+    # Always write locally
+    $null = New-Item -ItemType Directory -Force -Path $OutputDir
+    $timestamp = $Summary.timestamp_utc -replace '[:\-]', '' -replace 'T', '_' -replace 'Z', ''
+    $fileName  = "sync_$timestamp.json"
+    $localPath = Join-Path $OutputDir $fileName
+    $Summary | ConvertTo-Json -Depth 5 | Set-Content -Path $localPath -Encoding UTF8
+    Write-Host "  Audit log : $localPath" -ForegroundColor DarkGray
+
+    # Upload to S3 if configured
+    if ($S3Bucket) {
+        $s3Key = "$S3Prefix$fileName"
+        try {
+            aws s3 cp $localPath "s3://$S3Bucket/$s3Key" --quiet
+            Write-Host "  S3 upload : s3://$S3Bucket/$s3Key" -ForegroundColor DarkGray
+        }
+        catch {
+            Write-Warning "  S3 upload failed: $_"
+        }
+    }
+}
+
 #endregion
 
 #region ── Main ───────────────────────────────────────────────────────────────
 
 Write-Host '== Entra ID – Sync Device Groups by Department ==' -ForegroundColor Cyan
+
+$runId    = [System.Guid]::NewGuid().ToString()
+$startUtc = [DateTime]::UtcNow
 
 $isDryRun = $WhatIfPreference.IsPresent
 
@@ -139,13 +185,21 @@ $isDryRun = $WhatIfPreference.IsPresent
 if (-not (Test-Path $ConfigPath)) {
     throw "Config file not found: $ConfigPath"
 }
-$config       = Get-Content $ConfigPath -Raw | ConvertFrom-Json
-$groupPrefix  = $config.GroupNamePrefix
-$excludeDepts = [string[]]($config.ExcludeDepartments ?? @())
+$config        = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+$groupPrefix   = $config.GroupNamePrefix
+$excludeDepts  = [string[]]($config.ExcludeDepartments ?? @())
+$allowedDepts  = [string[]]($config.AllowedDepartments ?? @())
+$auditDir      = if ($config.AuditOutputDir) { $config.AuditOutputDir } else { Join-Path $PSScriptRoot 'audit-logs' }
+$s3Bucket      = $config.S3Bucket ?? ''
+$s3Prefix      = if ($config.S3Prefix) { $config.S3Prefix } else { 'azure-device-sync/' }
+
 if ($config.DryRun -eq $true) { $isDryRun = $true }
 
 if ($isDryRun) {
     Write-Host '[DRY RUN] No changes will be made.' -ForegroundColor Yellow
+}
+if ($allowedDepts.Count -gt 0) {
+    Write-Host "AllowedDepartments filter active ($($allowedDepts.Count) departments)." -ForegroundColor DarkGray
 }
 
 # Ensure Microsoft.Graph modules are available
@@ -158,6 +212,7 @@ foreach ($module in @('Microsoft.Graph.Authentication', 'Microsoft.Graph.Identit
 }
 
 Connect-Graph -Config $config
+$executedBy = (Get-MgContext).Account ?? 'unknown'
 
 # ── Step 1: Fetch all devices ─────────────────────────────────────────────────
 Write-Host "`nStep 1/3  Fetching all devices..."
@@ -166,9 +221,9 @@ Write-Host "  Found $($devices.Count) device(s)."
 
 # ── Step 2: Map devices to departments ───────────────────────────────────────
 Write-Host "`nStep 2/3  Mapping devices to departments via owner lookup..."
-$userCache        = @{}
-# dept -> list of device IDs
-$deptDeviceMap    = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[string]]]::new()
+$userCache     = @{}
+$unknownDepts  = [System.Collections.Generic.HashSet[string]]::new()
+$deptDeviceMap = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[string]]]::new()
 
 $i = 0
 foreach ($device in $devices) {
@@ -183,6 +238,12 @@ foreach ($device in $devices) {
         if (-not $dept) { continue }
         if ($dept -in $excludeDepts) { continue }
 
+        # AllowedDepartments check — warn and skip if not on the allowlist
+        if ($allowedDepts.Count -gt 0 -and $dept -notin $allowedDepts) {
+            $null = $unknownDepts.Add($dept)
+            continue
+        }
+
         if (-not $deptDeviceMap.ContainsKey($dept)) {
             $deptDeviceMap[$dept] = [System.Collections.Generic.List[string]]::new()
         }
@@ -193,7 +254,12 @@ foreach ($device in $devices) {
 }
 Write-Progress -Activity 'Mapping devices' -Completed
 
-Write-Host "  Departments found: $($deptDeviceMap.Keys -join ', ')"
+if ($unknownDepts.Count -gt 0) {
+    Write-Warning "  $($unknownDepts.Count) department(s) not in AllowedDepartments — skipped: $($unknownDepts -join ', ')"
+    Write-Warning "  Add them to AllowedDepartments in config.json to sync, or to ExcludeDepartments to suppress this warning."
+}
+
+Write-Host "  Departments to sync: $($deptDeviceMap.Keys -join ', ')"
 
 # ── Step 3: Sync groups ───────────────────────────────────────────────────────
 Write-Host "`nStep 3/3  Syncing groups..."
@@ -201,6 +267,7 @@ Write-Host "`nStep 3/3  Syncing groups..."
 $totalAdded    = 0
 $totalRemoved  = 0
 $groupsCreated = 0
+$groupChanges  = [System.Collections.Generic.List[hashtable]]::new()
 
 # Seed $deptGroups from ALL existing groups that match the prefix so that departments
 # which now have zero devices are still iterated and have stale members removed.
@@ -240,6 +307,13 @@ foreach ($dept in ($deptGroups.Keys | Sort-Object)) {
     $result = Sync-GroupMembers -GroupId $deptGroups[$dept].Id -DesiredDeviceIds $deviceIds -DryRun $isDryRun
     $totalAdded   += $result.Added
     $totalRemoved += $result.Removed
+
+    $groupChanges.Add(@{
+        department    = $dept
+        group         = $groupName
+        members_added = $result.Added
+        members_removed = $result.Removed
+    })
 }
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -248,10 +322,38 @@ Write-Host "  Departments processed : $($deptGroups.Count)"
 Write-Host "  Groups created        : $groupsCreated"
 Write-Host "  Members added         : $totalAdded"
 Write-Host "  Members removed       : $totalRemoved"
+if ($unknownDepts.Count -gt 0) {
+    Write-Host "  Unknown departments   : $($unknownDepts.Count) (skipped — see warnings above)" -ForegroundColor Yellow
+}
 
 if ($isDryRun) {
     Write-Host "`n[DRY RUN] Re-run without -WhatIf to apply changes." -ForegroundColor Yellow
 }
+
+# ── Audit export ─────────────────────────────────────────────────────────────
+$runSummary = @{
+    run_id              = $runId
+    timestamp_utc       = $startUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    executed_by         = $executedBy
+    dry_run             = $isDryRun
+    config = @{
+        group_prefix         = $groupPrefix
+        exclude_departments  = $excludeDepts
+        allowed_departments  = $allowedDepts
+    }
+    results = @{
+        devices_total           = $devices.Count
+        departments_processed   = $deptGroups.Count
+        groups_created          = $groupsCreated
+        members_added           = $totalAdded
+        members_removed         = $totalRemoved
+        unknown_departments     = @($unknownDepts)
+    }
+    group_changes = @($groupChanges)
+}
+
+Write-Host "`n== Audit log ==" -ForegroundColor Cyan
+Export-RunSummary -Summary $runSummary -OutputDir $auditDir -S3Bucket $s3Bucket -S3Prefix $s3Prefix
 
 Disconnect-MgGraph | Out-Null
 Write-Host "`nDone." -ForegroundColor Green
