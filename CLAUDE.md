@@ -66,12 +66,13 @@ Entra ID / Intune device group sync tool. Queries all Entra ID devices and their
 - `Get-DeviceReport.ps1` provides a read-only snapshot of current membership
 - Azure Audit Logs record all group membership changes made by the sync identity
 
-### Pending — High Priority
-- **No local audit export** — sync actions (devices added, removed, groups created) are written to the terminal only; if the script runs unattended (Azure Automation), this output is lost after the job expires; export a structured CSV/JSON summary of every run to a durable location (S3 or Azure Blob Storage)
-- **No S3 / Blob archival** — Azure Audit Logs retain group changes for 30 days (P1) or 7 days (free/P0); for SOX 7-year and GxP retention requirements, sync run summaries must be exported to long-term storage with immutable retention
-- **No run identity captured in output** — the script does not log which Azure Automation Managed Identity (or user) executed it; add `(Get-MgContext).Account` to the run summary header
+### Done
+- **Local audit export** — structured JSON summary written to `AuditOutputDir` (default `./audit-logs`) after every run; includes `run_id`, `timestamp_utc`, per-group change counts, and unknown departments list
+- **S3 archival** — audit summary uploaded to `s3://{S3Bucket}/{S3Prefix}{filename}` via `aws s3 cp` when `S3Bucket` is configured in config.json
+- **Run identity captured** — `executed_by = (Get-MgContext).Account` included in every run summary (the authenticated Graph identity)
+- **AllowedDepartments allowlist** — unknown department values trigger a warning and are skipped; add to `AllowedDepartments` in config.json to enable, or `ExcludeDepartments` to suppress the warning
+- **Run summary block** — totals (departments processed, groups created, members added/removed, unknown departments) printed at end of each run
 
 ### Pending — Medium Priority
-- `Sync-DeviceGroups.ps1` has no `-Audit` flag (only `Get-DeviceReport.ps1` does) — consolidate so a single script can both report and sync
-- No validation that `Department` attribute values conform to a canonical list — misspelled departments silently create new groups; add a config-driven allowed-departments list with a warning on unknown values
-- No summary block at the end of a run (total devices processed, groups created, members added/removed) — required for operators to confirm the run completed successfully
+- `Sync-DeviceGroups.ps1` has no `-Audit` flag (only `Get-DeviceReport.ps1` does) — consolidate so a single script can both report and sync without changes
+- No S3 Object Lock on audit log bucket — SOX 7-year retention requires immutable storage; configure Object Lock GOVERNANCE on the target S3 bucket outside this script
