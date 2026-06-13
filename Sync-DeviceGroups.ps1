@@ -161,7 +161,7 @@ function Export-RunSummary {
     if ($S3Bucket) {
         $s3Key = "$S3Prefix$fileName"
         try {
-            aws s3 cp $localPath "s3://$S3Bucket/$s3Key" --quiet
+            aws s3 cp "$localPath" "s3://$S3Bucket/$s3Key" --quiet
             Write-Host "  S3 upload : s3://$S3Bucket/$s3Key" -ForegroundColor DarkGray
         }
         catch {
@@ -290,7 +290,10 @@ foreach ($dept in $deptDeviceMap.Keys) {
     $groupName = "$groupPrefix$dept"
     $groupDesc = $config.GroupDescription -replace '\{Department\}', $dept
     $group = Get-OrCreateGroup -GroupName $groupName -Description $groupDesc -DryRun $isDryRun
-    if ($group) { $deptGroups[$dept] = $group } else { $groupsCreated++ }
+    if ($group) {
+        $deptGroups[$dept] = $group
+        $groupsCreated++
+    }
 }
 
 # Sync ALL groups — current departments AND existing groups whose department now
