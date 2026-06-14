@@ -76,3 +76,15 @@ Entra ID / Intune device group sync tool. Queries all Entra ID devices and their
 ### Pending — Medium Priority
 - `Sync-DeviceGroups.ps1` has no `-Audit` flag (only `Get-DeviceReport.ps1` does) — consolidate so a single script can both report and sync without changes
 - No S3 Object Lock on audit log bucket — SOX 7-year retention requires immutable storage; configure Object Lock GOVERNANCE on the target S3 bucket outside this script
+
+## NIST CSF 2.0 Alignment (Sections 3 & 4 — Profiles / Tier 2–3 Repeatable)
+
+| Function | Subcategory | How this tool addresses it |
+|---|---|---|
+| GOVERN | GV.PO-01 | `AllowedDepartments` allowlist in config.json documents the authorized group policy; drift surfaces as warnings |
+| IDENTIFY | ID.AM-01 | Inventories all Entra ID / Intune devices and maps each to a department-scoped security group |
+
+### Security Log Retention
+- No AWS CDK stack — audit exports written to local `./audit-logs/` directory; S3 upload optional via `S3Bucket` in config.json
+- When using S3 archival: configure **Object Lock GOVERNANCE 2555 days** and **Glacier transition at 365 days** on the target bucket for 1-year accessible security log retention
+- **Tier target**: Tier 2–3 — WhatIf/Audit dry-run mode, structured JSON audit export with `run_id` + `executed_by` identity; upgrade to Tier 3 by scheduling via Azure Automation runbook and adding CloudTrail/S3 Object Lock to the audit bucket
