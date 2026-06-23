@@ -73,8 +73,10 @@ Entra ID / Intune device group sync tool. Queries all Entra ID devices and their
 - **AllowedDepartments allowlist** — unknown department values trigger a warning and are skipped; add to `AllowedDepartments` in config.json to enable, or `ExcludeDepartments` to suppress the warning
 - **Run summary block** — totals (departments processed, groups created, members added/removed, unknown departments) printed at end of each run
 
+### Done (continued)
+- **`-Audit` flag** — `Sync-DeviceGroups.ps1` now accepts `-Audit` switch; sets `isDryRun=true` (no group or membership changes), labels console output `[AUDIT]`, and writes `audit_only=true` in the JSON run summary exported to `AuditOutputDir` and S3 — produces a compliance artifact showing current state without modification
+
 ### Pending — Medium Priority
-- `Sync-DeviceGroups.ps1` has no `-Audit` flag (only `Get-DeviceReport.ps1` does) — consolidate so a single script can both report and sync without changes
 - No S3 Object Lock on audit log bucket — SOX 7-year retention requires immutable storage; configure Object Lock GOVERNANCE on the target S3 bucket outside this script
 
 ## NIST CSF 2.0 Alignment (Sections 3 & 4 — Profiles / Tier 2–3 Repeatable)
