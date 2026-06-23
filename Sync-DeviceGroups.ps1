@@ -32,13 +32,20 @@
 .PARAMETER WhatIf
     Preview actions without applying any changes to Azure AD.
 
+.PARAMETER Audit
+    Report current group membership without making any changes and write an
+    audit log with audit_only=true. Equivalent to -WhatIf but produces a
+    signed audit artifact for compliance review.
+
 .EXAMPLE
     .\Sync-DeviceGroups.ps1 -WhatIf
     .\Sync-DeviceGroups.ps1
+    .\Sync-DeviceGroups.ps1 -Audit
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param (
-    [string] $ConfigPath = (Join-Path $PSScriptRoot 'config.json')
+    [string] $ConfigPath = (Join-Path $PSScriptRoot 'config.json'),
+    [switch] $Audit
 )
 
 Set-StrictMode -Version Latest
@@ -179,7 +186,7 @@ Write-Host '== Entra ID – Sync Device Groups by Department ==' -ForegroundColo
 $runId    = [System.Guid]::NewGuid().ToString()
 $startUtc = [DateTime]::UtcNow
 
-$isDryRun = $WhatIfPreference.IsPresent
+$isDryRun = $WhatIfPreference.IsPresent -or $Audit.IsPresent
 
 # Load config
 if (-not (Test-Path $ConfigPath)) {
@@ -195,7 +202,9 @@ $s3Prefix      = if ($config.S3Prefix) { $config.S3Prefix } else { 'azure-device
 
 if ($config.DryRun -eq $true) { $isDryRun = $true }
 
-if ($isDryRun) {
+if ($Audit.IsPresent) {
+    Write-Host '[AUDIT] Read-only audit run — no changes will be made.' -ForegroundColor Cyan
+} elseif ($isDryRun) {
     Write-Host '[DRY RUN] No changes will be made.' -ForegroundColor Yellow
 }
 if ($allowedDepts.Count -gt 0) {
@@ -339,6 +348,7 @@ $runSummary = @{
     timestamp_utc       = $startUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
     executed_by         = $executedBy
     dry_run             = $isDryRun
+    audit_only          = $Audit.IsPresent
     config = @{
         group_prefix         = $groupPrefix
         exclude_departments  = $excludeDepts
