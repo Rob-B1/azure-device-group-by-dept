@@ -7,7 +7,7 @@ Entra ID / Intune device group sync tool. Queries all Entra ID devices and their
 
 | Script | Purpose |
 |---|---|
-| `Sync-DeviceGroups.ps1` | Core sync: ensures one group per dept, adds/removes devices, cleans up stale dept groups |
+| `Sync-DeviceGroups.ps1` | Core sync: ensures one group per dept, adds/removes devices, removes stale members from dept groups (groups themselves are never deleted) |
 | `Sync-IntuneDeviceGroups.ps1` | Variant targeting Intune-managed devices (Compliance/OS-level filtering) |
 | `Get-DeviceReport.ps1` | Read-only audit: reports current device → owner → department → group membership |
 
@@ -17,17 +17,25 @@ Entra ID / Intune device group sync tool. Queries all Entra ID devices and their
 3. Build a `dept → [deviceId, ...]` map
 4. For each department, ensure a group `<GroupNamePrefix><Department>` exists (create if missing)
 5. Sync group membership: add devices that belong, remove those that don't
-6. Optional: remove groups for departments with no matching devices (stale cleanup)
+6. Groups for departments that now have zero devices have their stale members removed; the groups themselves are never deleted
 
 ## Configuration (`config.json`)
 ```json
 {
   "TenantId": "...",
-  "GroupNamePrefix": "DEPT-",
+  "GroupNamePrefix": "DEPT-DEVICES-",
+  "GroupDescription": "Auto-managed group for {Department} department devices",
   "ExcludeDepartments": ["Contractors"],
-  "DryRun": false
+  "AllowedDepartments": [],
+  "DryRun": false,
+  "AuditOutputDir": "./audit-logs",
+  "S3Bucket": "",
+  "S3Prefix": "azure-device-sync/"
 }
 ```
+
+All fields except `DryRun` are required and validated at startup; `GroupNamePrefix`
+must be at least 3 characters (guards against tenant-wide group scope).
 
 ## Running
 ```powershell
@@ -69,7 +77,7 @@ Entra ID / Intune device group sync tool. Queries all Entra ID devices and their
 ### Done
 - **Local audit export** — structured JSON summary written to `AuditOutputDir` (default `./audit-logs`) after every run; includes `run_id`, `timestamp_utc`, per-group change counts, and unknown departments list
 - **S3 archival** — audit summary uploaded to `s3://{S3Bucket}/{S3Prefix}{filename}` via `aws s3 cp` when `S3Bucket` is configured in config.json
-- **Run identity captured** — `executed_by = (Get-MgContext).Account` included in every run summary (the authenticated Graph identity)
+- **Run identity captured** — `executed_by` included in every run summary: `(Get-MgContext).Account`, falling back to `AppDisplayName`/`ClientId` for managed-identity (unattended) runs
 - **AllowedDepartments allowlist** — unknown department values trigger a warning and are skipped; add to `AllowedDepartments` in config.json to enable, or `ExcludeDepartments` to suppress the warning
 - **Run summary block** — totals (departments processed, groups created, members added/removed, unknown departments) printed at end of each run
 

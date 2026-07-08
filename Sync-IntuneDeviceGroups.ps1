@@ -12,9 +12,17 @@
     5. Removes any device from DEPT groups it no longer belongs to (department changes).
     6. Syncs group membership: adds devices that belong and removes those that don't.
 
-    Run with -WhatIf to preview all changes without making them.
-    Groups managed by this script always begin with "DEPT-" and end with " Devices"
-    so the script never touches unrelated groups.
+    Run with -WhatIf (or -DryRun) to preview all changes without making them.
+    Groups managed by this script must both begin with "DEPT-" AND end with
+    " Devices" — groups matching only one of the two are never touched.
+
+    Safety guards:
+      - Aborts a sync if the Intune or Entra ID device query returns an
+        implausibly low device count (< 5).
+      - A device whose assigned user's department lookup fails is treated as
+        "unknown" and is never removed from any group during that run.
+      - If more than 20% of a group's members would be removed, that group is
+        skipped with a warning unless -Force is passed.
 
 .PARAMETER TenantId
     Entra ID tenant ID. Optional — narrows the interactive login to a specific tenant.
@@ -30,14 +38,21 @@
 .PARAMETER OutputCsv
     When used with -Audit, writes the audit rows to this CSV file path.
 
+.PARAMETER DryRun
+    Preview actions inline without applying any changes to Entra ID (same as -WhatIf).
+
 .PARAMETER WhatIf
     Preview actions inline without applying any changes to Entra ID.
+
+.PARAMETER Force
+    Override the 20% per-group removal safety threshold.
 
 .EXAMPLE
     .\Sync-IntuneDeviceGroups.ps1 -Audit
     .\Sync-IntuneDeviceGroups.ps1 -Audit -OutputCsv .\audit.csv
     .\Sync-IntuneDeviceGroups.ps1 -Report
     .\Sync-IntuneDeviceGroups.ps1 -WhatIf
+    .\Sync-IntuneDeviceGroups.ps1 -DryRun
     .\Sync-IntuneDeviceGroups.ps1
     .\Sync-IntuneDeviceGroups.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 #>
@@ -46,11 +61,15 @@ param (
     [string] $TenantId = "",
     [switch] $Report,
     [switch] $Audit,
-    [string] $OutputCsv = ""
+    [string] $OutputCsv = "",
+    [switch] $DryRun,
+    [switch] $Force
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+Import-Module (Join-Path $PSScriptRoot 'SharedFunctions.psm1') -Force
 
 #region ── Constants ──────────────────────────────────────────────────────────
 
@@ -60,23 +79,6 @@ $GroupSuffix = ' Devices'
 #endregion
 
 #region ── Helpers ────────────────────────────────────────────────────────────
-
-function Install-GraphModules {
-    $modules = @(
-        'Microsoft.Graph.Authentication',
-        'Microsoft.Graph.Identity.DirectoryManagement',
-        'Microsoft.Graph.Users',
-        'Microsoft.Graph.Groups',
-        'Microsoft.Graph.DeviceManagement'
-    )
-    foreach ($module in $modules) {
-        if (-not (Get-Module -ListAvailable -Name $module)) {
-            Write-Host "Installing $module ..." -ForegroundColor Yellow
-            Install-Module $module -Scope CurrentUser -Force -AllowClobber
-        }
-        Import-Module $module -ErrorAction Stop
-    }
-}
 
 function Connect-GraphInteractive {
     param ([string] $TenantId)
@@ -94,116 +96,6 @@ function Connect-GraphInteractive {
     Connect-MgGraph @connectParams
 }
 
-function Get-DepartmentForUser {
-    param ([string] $UserId, [hashtable] $Cache)
-
-    if ($Cache.ContainsKey($UserId)) { return $Cache[$UserId] }
-
-    try {
-        $user = Get-MgUser -UserId $UserId -Property 'Department' -ErrorAction Stop
-        $dept = if ([string]::IsNullOrWhiteSpace($user.Department)) { $null } else { $user.Department.Trim() }
-        $Cache[$UserId] = $dept
-        return $dept
-    }
-    catch {
-        Write-Warning "  Could not retrieve user ${UserId}: $_"
-        $Cache[$UserId] = $null
-        return $null
-    }
-}
-
-function Get-OrCreateGroup {
-    param ([string] $GroupName, [string] $Description, [bool] $DryRun)
-
-    $existing = Get-MgGroup -Filter "displayName eq '$GroupName'" -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-
-    if ($existing) {
-        Write-Host "    Group exists: $GroupName" -ForegroundColor DarkGray
-        return $existing
-    }
-
-    if ($DryRun) {
-        Write-Host "    [WHATIF] Would create group: $GroupName" -ForegroundColor Yellow
-        return $null
-    }
-
-    Write-Host "    Creating group: $GroupName" -ForegroundColor Green
-    $mailNickname = 'DEPT' + (($GroupName -replace "^$([regex]::Escape($GroupPrefix))", '') -replace '[^a-zA-Z0-9]', '')
-    $newGroup = New-MgGroup -DisplayName $GroupName `
-                            -Description $Description `
-                            -MailEnabled:$false `
-                            -MailNickname $mailNickname `
-                            -SecurityEnabled:$true
-    return $newGroup
-}
-
-function Sync-GroupMembers {
-    param (
-        [string]   $GroupId,
-        [string[]] $DesiredDeviceIds,
-        [bool]     $DryRun
-    )
-
-    # Read current membership inside a try-catch so that a failed API call
-    # does not produce an empty list and cause every device to be re-added.
-    try {
-        $currentDeviceIds = @(
-            Get-MgGroupMemberAsDevice -GroupId $GroupId -All |
-            Select-Object -ExpandProperty Id
-        )
-    }
-    catch {
-        Write-Warning "      Could not read membership for group $GroupId — skipping sync: $_"
-        return [PSCustomObject]@{ Added = 0; Removed = 0 }
-    }
-
-    $toAdd    = $DesiredDeviceIds | Where-Object { $_ -notin $currentDeviceIds }
-    $toRemove = $currentDeviceIds | Where-Object { $_ -notin $DesiredDeviceIds }
-
-    foreach ($deviceId in $toAdd) {
-        if ($DryRun) {
-            Write-Host "      [WHATIF] Would add device $deviceId" -ForegroundColor Yellow
-        }
-        else {
-            Write-Host "      + Adding device $deviceId" -ForegroundColor Green
-            try {
-                $odataBody = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$deviceId" }
-                New-MgGroupMemberByRef -GroupId $GroupId -BodyParameter $odataBody
-            }
-            catch {
-                if (($_ | Out-String) -match 'already exist') {
-                    Write-Verbose "      Device $deviceId already in group (skipped)."
-                }
-                else {
-                    Write-Warning "      Failed to add ${deviceId}: $_"
-                }
-            }
-        }
-    }
-
-    foreach ($deviceId in $toRemove) {
-        if ($DryRun) {
-            Write-Host "      [WHATIF] Would remove device $deviceId" -ForegroundColor Yellow
-        }
-        else {
-            Write-Host "      - Removing device $deviceId" -ForegroundColor Red
-            try {
-                Remove-MgGroupMemberByRef -GroupId $GroupId -DirectoryObjectId $deviceId
-            }
-            catch {
-                Write-Warning "      Failed to remove ${deviceId}: $_"
-            }
-        }
-    }
-
-    if (-not $toAdd -and -not $toRemove) {
-        Write-Host "      (No membership changes)" -ForegroundColor DarkGray
-    }
-
-    return [PSCustomObject]@{ Added = $toAdd.Count; Removed = $toRemove.Count }
-}
-
 function Get-GroupChanges {
     param (
         [string]   $GroupId,           # $null when the group doesn't exist yet
@@ -215,7 +107,7 @@ function Get-GroupChanges {
         return [PSCustomObject]@{
             GroupName = $GroupName
             IsNew     = $true
-            ToAdd     = $DesiredDeviceIds
+            ToAdd     = @($DesiredDeviceIds)
             ToRemove  = @()
             Error     = $null
         }
@@ -300,9 +192,11 @@ function Write-ChangeReport {
 
 function Remove-StaleGroupMembers {
     param (
-        [object]    $DeptDeviceMap,  # Dictionary<dept, List<aadObjectId>>
-        [hashtable] $DeptGroups,     # dept -> group object
-        [bool]      $DryRun
+        [object]    $DeptDeviceMap,       # Dictionary<dept, List<aadObjectId>>
+        [hashtable] $DeptGroups,          # dept -> group object
+        [string[]]  $ProtectedDeviceIds = @(),  # devices with unknown status — never remove
+        [bool]      $DryRun = $false,
+        [bool]      $Force = $false
     )
 
     # Build: aadObjectId -> correct group ID so we can detect misplaced devices.
@@ -328,10 +222,19 @@ function Remove-StaleGroupMembers {
             continue
         }
 
-        foreach ($memberId in $memberIds) {
-            $correctGroupId = if ($deviceCorrectGroup.ContainsKey($memberId)) { $deviceCorrectGroup[$memberId] } else { $null }
-            if ($correctGroupId -eq $grp.Id) { continue }
+        $staleIds = @($memberIds | Where-Object {
+            ($_ -notin $ProtectedDeviceIds) -and
+            (-not $deviceCorrectGroup.ContainsKey($_) -or $deviceCorrectGroup[$_] -ne $grp.Id)
+        })
 
+        # Safety threshold: refuse to remove more than 20% of a group's members
+        # in one cleanup pass unless explicitly forced.
+        if (-not $Force -and $memberIds.Count -gt 0 -and ($staleIds.Count / $memberIds.Count) -gt 0.2) {
+            Write-Warning ("    Skipping stale cleanup for '{0}': {1} of {2} members would be removed (>20% safety threshold). Re-run with -Force to override." -f $grp.DisplayName, $staleIds.Count, $memberIds.Count)
+            continue
+        }
+
+        foreach ($memberId in $staleIds) {
             if ($DryRun) {
                 Write-Host "    [WHATIF] Would remove stale device $memberId from $($grp.DisplayName)" -ForegroundColor Yellow
             }
@@ -420,188 +323,261 @@ function Write-AuditReport {
 
 Write-Host '== Intune – Sync Device Groups by Department ==' -ForegroundColor Cyan
 
-$isDryRun = $WhatIfPreference.IsPresent
+# $WhatIfPreference is a plain [bool] when -WhatIf is not passed; casting keeps
+# this safe under Set-StrictMode (no .IsPresent on a bool).
+$isDryRun = [bool]$WhatIfPreference -or $DryRun.IsPresent
 if ($isDryRun) {
     Write-Host '[DRY RUN] No changes will be made.' -ForegroundColor Yellow
 }
 
 # Install and import required Graph modules
-Install-GraphModules
+Initialize-GraphModules -Modules @(
+    'Microsoft.Graph.Authentication',
+    'Microsoft.Graph.Identity.DirectoryManagement',
+    'Microsoft.Graph.Users',
+    'Microsoft.Graph.Groups',
+    'Microsoft.Graph.DeviceManagement'
+)
 
-# Authenticate interactively (browser prompt)
-Connect-GraphInteractive -TenantId $TenantId
+$runError       = $null
+$graphConnected = $false
 
-# ── Step 1: Fetch Intune-managed devices ──────────────────────────────────────
-Write-Host "`nStep 1/4  Fetching Intune-managed Windows and macOS devices..."
-$intuneDevices = Get-MgDeviceManagementManagedDevice -All `
-    -Filter "operatingSystem eq 'Windows' or operatingSystem eq 'macOS'" `
-    -Property 'id,deviceName,operatingSystem,userId,userPrincipalName,azureADDeviceId'
-Write-Host "  Found $($intuneDevices.Count) device(s)."
+try {
+    # Authenticate interactively (browser prompt)
+    Connect-GraphInteractive -TenantId $TenantId
+    $graphConnected = $true
 
-# ── Step 2: Build Azure AD device ID map ─────────────────────────────────────
-Write-Host "`nStep 2/4  Building Azure AD device ID map..."
-$aadDevices = Get-MgDevice -All
-$aadDeviceMap = @{}
-foreach ($aad in $aadDevices) {
-    if ($aad.DeviceId) { $aadDeviceMap[$aad.DeviceId] = $aad.Id }
-}
-Write-Host "  Mapped $($aadDeviceMap.Count) Azure AD device(s)."
+    # ── Step 1: Fetch Intune-managed devices ──────────────────────────────────
+    Write-Host "`nStep 1/4  Fetching Intune-managed Windows and macOS devices..."
+    $intuneDevices = @(Get-MgDeviceManagementManagedDevice -All `
+        -Filter "operatingSystem eq 'Windows' or operatingSystem eq 'macOS'" `
+        -Property 'id,deviceName,operatingSystem,userId,userPrincipalName,azureADDeviceId')
+    Write-Host "  Found $($intuneDevices.Count) device(s)."
 
-# ── Step 3: Map devices to departments ───────────────────────────────────────
-Write-Host "`nStep 3/4  Mapping devices to departments via assigned user lookup..."
-$userCache     = @{}
-$deptDeviceMap = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[string]]]::new()
-
-$i = 0
-foreach ($device in $intuneDevices) {
-    $i++
-    Write-Progress -Activity 'Mapping devices' -Status $device.deviceName -PercentComplete (($i / $intuneDevices.Count) * 100)
-
-    # Resolve Intune device to Azure AD object ID
-    if (-not $device.azureADDeviceId -or -not $aadDeviceMap.ContainsKey($device.azureADDeviceId)) {
-        Write-Verbose "  No AAD object ID for $($device.deviceName) (azureADDeviceId: $($device.azureADDeviceId)). Skipping."
-        continue
+    # Guard: an implausibly small device list is almost certainly a query
+    # failure; a sync based on it would empty every managed group.
+    if (-not $Report -and -not $Audit -and $intuneDevices.Count -lt 5) {
+        throw "Intune returned only $($intuneDevices.Count) managed device(s) — implausibly low. Aborting sync to avoid mass-removing group members."
     }
-    $aadObjectId = $aadDeviceMap[$device.azureADDeviceId]
 
-    # Resolve assigned user's department
-    if (-not $device.userId) { continue }
-    $dept = Get-DepartmentForUser -UserId $device.userId -Cache $userCache
-    if (-not $dept) { continue }
-
-    if (-not $deptDeviceMap.ContainsKey($dept)) {
-        $deptDeviceMap[$dept] = [System.Collections.Generic.List[string]]::new()
+    # ── Step 2: Build Azure AD device ID map ─────────────────────────────────
+    Write-Host "`nStep 2/4  Building Azure AD device ID map..."
+    $aadDevices = @(Get-MgDevice -All)
+    if (-not $Report -and -not $Audit -and $aadDevices.Count -lt 5) {
+        throw "Get-MgDevice returned only $($aadDevices.Count) device(s) — implausibly low. Aborting sync to avoid mass-removing group members."
     }
-    if ($aadObjectId -notin $deptDeviceMap[$dept]) {
-        $deptDeviceMap[$dept].Add($aadObjectId)
+    $aadDeviceMap = @{}
+    foreach ($aad in $aadDevices) {
+        if ($aad.DeviceId) { $aadDeviceMap[$aad.DeviceId] = $aad.Id }
     }
-}
-Write-Progress -Activity 'Mapping devices' -Completed
+    Write-Host "  Mapped $($aadDeviceMap.Count) Azure AD device(s)."
 
-$deptList = if ($deptDeviceMap.Count -gt 0) { $deptDeviceMap.Keys -join ', ' } else { '(none)' }
-Write-Host "  Departments found: $deptList"
+    # ── Step 3: Map devices to departments ───────────────────────────────────
+    Write-Host "`nStep 3/4  Mapping devices to departments via assigned user lookup..."
+    $userCache           = @{}
+    $unresolvedDeviceIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $deptDeviceMap       = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[string]]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
-# ── Step 4: Sync groups ───────────────────────────────────────────────────────
-Write-Host "`nStep 4/4  Syncing groups..."
-
-$totalAdded    = 0
-$totalRemoved  = 0
-$staleRemoved  = 0
-$groupsCreated = 0
-
-# Seed deptGroups from ALL existing DEPT-* Devices groups so stale departments
-# are iterated and have their members removed even when they now have zero devices.
-$deptGroups = @{}
-$existingGroups = Get-MgGroup `
-    -Filter "startsWith(displayName,'$GroupPrefix') and securityEnabled eq true" `
-    -ConsistencyLevel eventual `
-    -CountVariable existingCount `
-    -All
-foreach ($grp in $existingGroups) {
-    $existingDept = $grp.DisplayName.Substring($GroupPrefix.Length) -replace "$([regex]::Escape($GroupSuffix))$", ''
-    if (-not $deptGroups.ContainsKey($existingDept)) {
-        $deptGroups[$existingDept] = $grp
-    }
-}
-
-# ── Report mode: show all pending changes and exit without writing anything ───
-if ($Report) {
-    $allDepts = @(@($deptGroups.Keys) + @($deptDeviceMap.Keys) | Sort-Object -Unique)
-    $changes  = foreach ($dept in $allDepts) {
-        $deviceIds = [string[]]@()
-        if ($deptDeviceMap.ContainsKey($dept)) { $deviceIds = [string[]]$deptDeviceMap[$dept] }
-        $groupName = "$GroupPrefix$dept$GroupSuffix"
-        $groupId   = if ($deptGroups.ContainsKey($dept)) { $deptGroups[$dept].Id } else { $null }
-        Get-GroupChanges -GroupId $groupId -GroupName $groupName -DesiredDeviceIds $deviceIds
-    }
-    Write-ChangeReport -Changes $changes
-    Disconnect-MgGraph | Out-Null
-    return
-}
-
-# ── Audit mode: report current device → user → DEPT group membership ─────────
-if ($Audit) {
-    Write-Host "`nBuilding device group membership map..."
-    $deviceGroupMap = Get-DeviceGroupMap -DeptGroups $deptGroups
-
-    $auditRows = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $i = 0
     foreach ($device in $intuneDevices) {
-        $aadObjectId = $null
-        if ($device.azureADDeviceId -and $aadDeviceMap.ContainsKey($device.azureADDeviceId)) {
-            $aadObjectId = $aadDeviceMap[$device.azureADDeviceId]
-        }
+        $i++
+        Write-Progress -Activity 'Mapping devices' -Status $device.deviceName -PercentComplete (($i / $intuneDevices.Count) * 100)
 
-        $dept = $null
-        if ($device.userId) {
-            $dept = Get-DepartmentForUser -UserId $device.userId -Cache $userCache
+        # Resolve Intune device to Azure AD object ID
+        if (-not $device.azureADDeviceId -or -not $aadDeviceMap.ContainsKey($device.azureADDeviceId)) {
+            Write-Verbose "  No AAD object ID for $($device.deviceName) (azureADDeviceId: $($device.azureADDeviceId)). Skipping."
+            continue
         }
+        $aadObjectId = $aadDeviceMap[$device.azureADDeviceId]
 
-        $groupStr = if ($aadObjectId -and $deviceGroupMap.ContainsKey($aadObjectId)) {
-            $deviceGroupMap[$aadObjectId] -join '; '
-        } else {
-            '(Not in any DEPT group)'
+        # Resolve assigned user's department. A FAILED lookup means the device's
+        # department is UNKNOWN — protect it from removals this run rather than
+        # treating it as department-less.
+        if (-not $device.userId) { continue }
+        $lookup = Get-DepartmentForUser -UserId $device.userId -Cache $userCache
+        if ($lookup.LookupFailed) {
+            $null = $unresolvedDeviceIds.Add($aadObjectId)
+            continue
         }
+        $dept = $lookup.Department
+        if (-not $dept) { continue }
 
-        $auditRows.Add([PSCustomObject]@{
-            DeviceName  = $device.deviceName
-            OS          = $device.operatingSystem
-            UserUPN     = if ($device.userPrincipalName) { $device.userPrincipalName } else { '(No user)' }
-            Department  = if ($dept) { $dept } else { '(No department)' }
-            DeptGroups  = $groupStr
-            AADObjectId = if ($aadObjectId) { $aadObjectId } else { '(Not in AAD)' }
-            IntuneId    = $device.id
-        })
+        if (-not $deptDeviceMap.ContainsKey($dept)) {
+            $deptDeviceMap[$dept] = [System.Collections.Generic.List[string]]::new()
+        }
+        if ($aadObjectId -notin $deptDeviceMap[$dept]) {
+            $deptDeviceMap[$dept].Add($aadObjectId)
+        }
+    }
+    Write-Progress -Activity 'Mapping devices' -Completed
+
+    if ($unresolvedDeviceIds.Count -gt 0) {
+        Write-Warning "  $($unresolvedDeviceIds.Count) device(s) had failed user/department lookups — they will not be removed from any group this run."
     }
 
-    Write-AuditReport -Rows $auditRows -OutputCsv $OutputCsv
-    Disconnect-MgGraph | Out-Null
-    return
-}
+    $deptList = if ($deptDeviceMap.Count -gt 0) { $deptDeviceMap.Keys -join ', ' } else { '(none)' }
+    Write-Host "  Departments found: $deptList"
 
-# ── Cleanup: remove any device found in a group whose department it no longer belongs to ──
-Write-Host "`n  Removing stale group memberships (department changes)..."
-$staleRemoved = Remove-StaleGroupMembers -DeptDeviceMap $deptDeviceMap -DeptGroups $deptGroups -DryRun $isDryRun
-if (-not $isDryRun -and $staleRemoved -eq 0) {
-    Write-Host "    (No stale memberships found)" -ForegroundColor DarkGray
-}
+    # ── Step 4: Sync groups ───────────────────────────────────────────────────
+    Write-Host "`nStep 4/4  Syncing groups..."
 
-# Create groups for newly discovered departments that don't have one yet
-foreach ($dept in $deptDeviceMap.Keys) {
-    if ($deptGroups.ContainsKey($dept)) { continue }
-    $groupName = "$GroupPrefix$dept$GroupSuffix"
-    $groupDesc = "Intune-managed device group for $dept department"
-    $group = Get-OrCreateGroup -GroupName $groupName -Description $groupDesc -DryRun $isDryRun
-    if ($group) { $deptGroups[$dept] = $group } else { $groupsCreated++ }
-}
+    $totalAdded    = 0
+    $totalRemoved  = 0
+    $staleRemoved  = 0
+    $groupsCreated = 0
+    $groupsSkipped = 0
 
-# Sync all groups — current departments and any existing groups whose department
-# now has zero devices (their $deviceIds will be empty, removing all stale members)
-foreach ($dept in ($deptGroups.Keys | Sort-Object)) {
-    $deviceIds = [string[]]@()
-    if ($deptDeviceMap.ContainsKey($dept)) {
-        $deviceIds = [string[]]$deptDeviceMap[$dept]
+    # Seed deptGroups from ALL existing "DEPT-* Devices" groups so stale departments
+    # are iterated and have their members removed even when they now have zero devices.
+    # Only groups matching BOTH the prefix and the suffix are adopted — this enforces
+    # the "never touches unrelated groups" guarantee (e.g. "DEPT-Payroll" is skipped).
+    $safePrefix = ConvertTo-ODataLiteral -Value $GroupPrefix
+    $deptGroups = @{}
+    $existingGroups = @(Get-MgGroup `
+        -Filter "startsWith(displayName,'$safePrefix') and securityEnabled eq true" `
+        -ConsistencyLevel eventual `
+        -CountVariable existingCount `
+        -All)
+    foreach ($grp in $existingGroups) {
+        if (-not $grp.DisplayName.EndsWith($GroupSuffix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-Verbose "  Ignoring group '$($grp.DisplayName)' — matches prefix but not suffix '$GroupSuffix'."
+            continue
+        }
+        $existingDept = $grp.DisplayName.Substring($GroupPrefix.Length) -replace "$([regex]::Escape($GroupSuffix))$", ''
+        if (-not $deptGroups.ContainsKey($existingDept)) {
+            $deptGroups[$existingDept] = $grp
+        }
     }
-    $groupName = "$GroupPrefix$dept$GroupSuffix"
-    Write-Host "`n  Department: $dept ($($deviceIds.Count) device(s)) -> Group: $groupName"
 
-    $result = Sync-GroupMembers -GroupId $deptGroups[$dept].Id -DesiredDeviceIds $deviceIds -DryRun $isDryRun
-    $totalAdded   += $result.Added
-    $totalRemoved += $result.Removed
+    # ── Report mode: show all pending changes and exit without writing anything ──
+    if ($Report) {
+        $allDepts = @(@($deptGroups.Keys) + @($deptDeviceMap.Keys) | Sort-Object -Unique)
+        $changes  = foreach ($dept in $allDepts) {
+            $deviceIds = [string[]]@()
+            if ($deptDeviceMap.ContainsKey($dept)) { $deviceIds = [string[]]$deptDeviceMap[$dept] }
+            $groupName = "$GroupPrefix$dept$GroupSuffix"
+            $groupId   = if ($deptGroups.ContainsKey($dept)) { $deptGroups[$dept].Id } else { $null }
+            Get-GroupChanges -GroupId $groupId -GroupName $groupName -DesiredDeviceIds $deviceIds
+        }
+        Write-ChangeReport -Changes $changes
+        return
+    }
+
+    # ── Audit mode: report current device → user → DEPT group membership ─────
+    if ($Audit) {
+        Write-Host "`nBuilding device group membership map..."
+        $deviceGroupMap = Get-DeviceGroupMap -DeptGroups $deptGroups
+
+        $auditRows = [System.Collections.Generic.List[PSCustomObject]]::new()
+        foreach ($device in $intuneDevices) {
+            $aadObjectId = $null
+            if ($device.azureADDeviceId -and $aadDeviceMap.ContainsKey($device.azureADDeviceId)) {
+                $aadObjectId = $aadDeviceMap[$device.azureADDeviceId]
+            }
+
+            $dept = $null
+            if ($device.userId) {
+                $lookup = Get-DepartmentForUser -UserId $device.userId -Cache $userCache
+                if (-not $lookup.LookupFailed) { $dept = $lookup.Department }
+            }
+
+            $groupStr = if ($aadObjectId -and $deviceGroupMap.ContainsKey($aadObjectId)) {
+                $deviceGroupMap[$aadObjectId] -join '; '
+            } else {
+                '(Not in any DEPT group)'
+            }
+
+            $auditRows.Add([PSCustomObject]@{
+                DeviceName  = $device.deviceName
+                OS          = $device.operatingSystem
+                UserUPN     = if ($device.userPrincipalName) { $device.userPrincipalName } else { '(No user)' }
+                Department  = if ($dept) { $dept } else { '(No department)' }
+                DeptGroups  = $groupStr
+                AADObjectId = if ($aadObjectId) { $aadObjectId } else { '(Not in AAD)' }
+                IntuneId    = $device.id
+            })
+        }
+
+        Write-AuditReport -Rows $auditRows -OutputCsv $OutputCsv
+        return
+    }
+
+    # Wire ShouldProcess at the destructive boundary: honors -Confirm, and keeps
+    # -WhatIf semantics consistent with the declared SupportsShouldProcess.
+    if (-not $isDryRun -and -not $PSCmdlet.ShouldProcess('DEPT-* Devices groups', 'Apply group and membership changes')) {
+        $isDryRun = $true
+    }
+
+    # ── Cleanup: remove any device found in a group whose department it no longer belongs to ──
+    Write-Host "`n  Removing stale group memberships (department changes)..."
+    $staleRemoved = Remove-StaleGroupMembers -DeptDeviceMap $deptDeviceMap `
+                                             -DeptGroups $deptGroups `
+                                             -ProtectedDeviceIds @($unresolvedDeviceIds) `
+                                             -DryRun $isDryRun `
+                                             -Force $Force.IsPresent
+    if (-not $isDryRun -and $staleRemoved -eq 0) {
+        Write-Host "    (No stale memberships found)" -ForegroundColor DarkGray
+    }
+
+    # Create groups for newly discovered departments that don't have one yet
+    foreach ($dept in $deptDeviceMap.Keys) {
+        if ($deptGroups.ContainsKey($dept)) { continue }
+        $groupName = "$GroupPrefix$dept$GroupSuffix"
+        $groupDesc = "Intune-managed device group for $dept department"
+        $created = Get-OrCreateGroup -GroupName $groupName -Description $groupDesc -DryRun $isDryRun
+        if ($created.Created) { $groupsCreated++ }
+        if ($created.Group)   { $deptGroups[$dept] = $created.Group }
+    }
+
+    # Sync all groups — current departments and any existing groups whose department
+    # now has zero devices (their $deviceIds will be empty, removing all stale
+    # members — subject to the 20% safety threshold)
+    foreach ($dept in ($deptGroups.Keys | Sort-Object)) {
+        $deviceIds = [string[]]@()
+        if ($deptDeviceMap.ContainsKey($dept)) {
+            $deviceIds = [string[]]$deptDeviceMap[$dept]
+        }
+        $groupName = "$GroupPrefix$dept$GroupSuffix"
+        Write-Host "`n  Department: $dept ($($deviceIds.Count) device(s)) -> Group: $groupName"
+
+        $result = Sync-GroupMembers -GroupId $deptGroups[$dept].Id `
+                                    -GroupName $groupName `
+                                    -DesiredDeviceIds $deviceIds `
+                                    -ProtectedDeviceIds @($unresolvedDeviceIds) `
+                                    -DryRun $isDryRun `
+                                    -Force $Force.IsPresent
+        $totalAdded   += $result.Added
+        $totalRemoved += $result.Removed
+        if ($result.Skipped) { $groupsSkipped++ }
+    }
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    Write-Host "`n== Summary ==" -ForegroundColor Cyan
+    Write-Host "  Departments processed : $($deptGroups.Count)"
+    Write-Host "  Groups created        : $groupsCreated"
+    Write-Host "  Groups skipped (guard): $groupsSkipped"
+    Write-Host "  Stale memberships     : $staleRemoved"
+    Write-Host "  Members added         : $totalAdded"
+    Write-Host "  Members removed       : $totalRemoved"
+
+    if ($isDryRun) {
+        Write-Host "`n[DRY RUN] Re-run without -WhatIf to apply changes." -ForegroundColor Yellow
+    }
+}
+catch {
+    $runError = $_
+}
+finally {
+    # Always disconnect, even when a mid-run failure occurs.
+    if ($graphConnected) {
+        try { Disconnect-MgGraph | Out-Null } catch { Write-Warning "Disconnect-MgGraph failed: $_" }
+    }
 }
 
-# ── Summary ───────────────────────────────────────────────────────────────────
-Write-Host "`n== Summary ==" -ForegroundColor Cyan
-Write-Host "  Departments processed : $($deptGroups.Count)"
-Write-Host "  Groups created        : $groupsCreated"
-Write-Host "  Stale memberships     : $staleRemoved"
-Write-Host "  Members added         : $totalAdded"
-Write-Host "  Members removed       : $totalRemoved"
-
-if ($isDryRun) {
-    Write-Host "`n[DRY RUN] Re-run without -WhatIf to apply changes." -ForegroundColor Yellow
+if ($runError) {
+    throw $runError
 }
 
-Disconnect-MgGraph | Out-Null
 Write-Host "`nDone." -ForegroundColor Green
 
 #endregion

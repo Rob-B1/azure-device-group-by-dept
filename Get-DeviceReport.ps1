@@ -26,31 +26,18 @@ param (
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+Import-Module (Join-Path $PSScriptRoot 'SharedFunctions.psm1') -Force
+
 #region ── Helpers ────────────────────────────────────────────────────────────
 
-function Connect-Graph {
+# Named Connect-GraphSession (not Connect-Graph) because recent
+# Microsoft.Graph.Authentication versions export a 'Connect-Graph' alias that
+# would shadow a local function of the same name.
+function Connect-GraphSession {
     param ($Config)
     Connect-MgGraph -TenantId $Config.TenantId `
         -Scopes 'Device.Read.All', 'User.Read.All', 'Group.Read.All' `
         -NoWelcome
-}
-
-function Get-DepartmentForUser {
-    param ([string] $UserId, [hashtable] $Cache)
-
-    if ($Cache.ContainsKey($UserId)) { return $Cache[$UserId] }
-
-    try {
-        $user = Get-MgUser -UserId $UserId -Property 'Department,DisplayName' -ErrorAction Stop
-        $dept = if ([string]::IsNullOrWhiteSpace($user.Department)) { '(No Department)' } else { $user.Department.Trim() }
-        $Cache[$UserId] = $dept
-        return $dept
-    }
-    catch {
-        Write-Warning "  Could not retrieve user $UserId : $_"
-        $Cache[$UserId] = '(Unknown)'
-        return '(Unknown)'
-    }
 }
 
 #endregion
@@ -66,15 +53,13 @@ if (-not (Test-Path $ConfigPath)) {
 $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
 
 # Ensure Microsoft.Graph modules are available
-foreach ($module in @('Microsoft.Graph.Authentication', 'Microsoft.Graph.Identity.DirectoryManagement', 'Microsoft.Graph.Users')) {
-    if (-not (Get-Module -ListAvailable -Name $module)) {
-        Write-Host "Installing $module ..." -ForegroundColor Yellow
-        Install-Module $module -Scope CurrentUser -Force -AllowClobber
-    }
-    Import-Module $module -ErrorAction Stop
-}
+Initialize-GraphModules -Modules @(
+    'Microsoft.Graph.Authentication',
+    'Microsoft.Graph.Identity.DirectoryManagement',
+    'Microsoft.Graph.Users'
+)
 
-Connect-Graph -Config $config
+Connect-GraphSession -Config $config
 
 # Fetch all devices
 Write-Host "`nFetching all devices..."
@@ -93,7 +78,10 @@ foreach ($device in $devices) {
     $owners = Get-MgDeviceRegisteredOwner -DeviceId $device.Id -All -ErrorAction SilentlyContinue
     $ownerInfo = if ($owners) {
         $owners | ForEach-Object {
-            $dept = Get-DepartmentForUser -UserId $_.Id -Cache $userCache
+            $lookup = Get-DepartmentForUser -UserId $_.Id -Cache $userCache
+            $dept = if ($lookup.LookupFailed) { '(Unknown)' }
+                    elseif ($lookup.Department) { $lookup.Department }
+                    else { '(No Department)' }
             [PSCustomObject]@{ OwnerUPN = $_.AdditionalProperties['userPrincipalName']; Department = $dept }
         }
     }

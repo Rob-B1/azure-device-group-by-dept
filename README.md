@@ -17,10 +17,23 @@ Two approaches are provided depending on your device management platform:
 
 | File | Purpose |
 |---|---|
-| `config.json` | Tenant / client ID, group naming, exclusions |
+| `config.json` | Tenant ID, group naming, exclusions, audit/S3 settings |
+| `SharedFunctions.psm1` | Shared helpers (module bootstrap, department lookup, group create/sync) used by all three scripts |
 | `Get-DeviceReport.ps1` | Read & report Entra ID devices grouped by department |
 | `Sync-DeviceGroups.ps1` | Create / update one group per department (Entra ID approach) |
 | `Sync-IntuneDeviceGroups.ps1` | Create / update one group per department (Intune approach) |
+
+### Safety guards (both sync scripts)
+
+- The sync aborts if the device query returns an implausibly low count (< 5) — a
+  transient Graph failure must not empty every managed group.
+- A device whose owner/assigned-user or department lookup fails is treated as
+  "unknown" and is never removed from any group during that run.
+- If more than 20% of a group's members would be removed in one run, that group
+  is skipped with a warning. Pass `-Force` to override.
+- `Sync-DeviceGroups.ps1` writes a JSON run summary to `AuditOutputDir` on every
+  run — including failed runs, with `status` and `error` fields — and uploads it
+  to S3 when `S3Bucket` is configured.
 
 ---
 
@@ -56,22 +69,31 @@ Edit `config.json`:
 ```json
 {
   "TenantId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-  "ClientId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
   "GroupNamePrefix": "DEPT-DEVICES-",
   "GroupDescription": "Auto-managed group for {Department} department devices",
   "ExcludeDepartments": ["Test", "Temp"],
-  "DryRun": false
+  "AllowedDepartments": [],
+  "DryRun": false,
+  "AuditOutputDir": "./audit-logs",
+  "S3Bucket": "",
+  "S3Prefix": "azure-device-sync/"
 }
 ```
 
-| Field | Description |
-|---|---|
-| `TenantId` | Your Entra ID tenant ID |
-| `ClientId` | App registration client ID |
-| `GroupNamePrefix` | Prefix for created groups |
-| `GroupDescription` | Group description; `{Department}` is replaced at runtime |
-| `ExcludeDepartments` | Departments to skip entirely |
-| `DryRun` | Set `true` to preview without making changes |
+| Field | Required | Description |
+|---|---|---|
+| `TenantId` | Yes | Your Entra ID tenant ID |
+| `GroupNamePrefix` | Yes | Prefix for created groups — must be at least 3 characters (an empty prefix would give the script tenant-wide destructive scope, so the script refuses to run) |
+| `GroupDescription` | Yes | Group description; `{Department}` is replaced at runtime |
+| `ExcludeDepartments` | Yes | Departments to skip entirely (use `[]` for none) |
+| `AllowedDepartments` | Yes | If non-empty, only these departments are processed; unknown departments trigger a warning and are skipped (use `[]` to allow all) |
+| `DryRun` | No | Set `true` to preview without making changes |
+| `AuditOutputDir` | Yes | Local directory for JSON run summaries (e.g. `./audit-logs`) |
+| `S3Bucket` | Yes | S3 bucket for long-term audit retention (use `""` to disable S3 upload) |
+| `S3Prefix` | Yes | S3 key prefix for uploaded audit logs |
+
+The script validates at startup that all required fields are present and that
+`GroupNamePrefix` is at least 3 characters, and aborts with a clear error otherwise.
 
 ### 2. Run the report
 
@@ -127,14 +149,14 @@ modifies unrelated groups that happen to end in " Devices".
 
 ### Operating modes
 
-#### Report mode — preview pending changes without connecting to Entra ID
+#### Report mode — preview pending changes (read-only)
 
 ```powershell
-# Show what would change (requires Intune, reads current state)
+# Show what would change (connects to Entra ID/Intune, reads current state)
 .\Sync-IntuneDeviceGroups.ps1 -Report
 ```
 
-Prints a table of all devices with their current department, target group, and whether they need to be added or removed. No API writes are made.
+Connects to Entra ID and Intune to read the current state, then prints a table of all devices with their current department, target group, and whether they need to be added or removed. No API writes are made.
 
 #### Audit mode — show current group membership and flag mismatches
 
